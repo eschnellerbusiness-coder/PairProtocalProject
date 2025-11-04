@@ -1,0 +1,151 @@
+# --- VERSION 6.1 START ---
+# Pico-to-Pico PWM Communication & Measurement Program (v6.1)
+# - Works for both devices: Controller ↔ Monitor (auto-selects role)
+# - Fixes UART message fragmentation by assembling complete lines
+# - Adds detailed comments throughout
+# - Monitor now calculates and prints measurement error
+# TX = GP8, RX = GP9, PWM = GP15, ADC = GP26 (A0)
+
+from machine import Pin, UART, PWM, ADC
+from time import sleep, ticks_ms, ticks_diff
+
+# ---- Setup Hardware ----
+uart = UART(1, baudrate=9600, tx=Pin(8), rx=Pin(9))   # UART1 communication pins
+adc = ADC(26)                                         # ADC input pin (GP26/A0)
+pwm = PWM(Pin(15))                                    # PWM output pin (GP15)
+pwm.freq(1000)                                        # Set PWM frequency to 1 kHz
+
+led = Pin(25, Pin.OUT)  # Onboard LED for debugging feedback
+
+# ---- Helper Functions ----
+def send(cmd, value):
+    """Send a formatted UART message with a command and numeric value."""
+    uart.write(f"{cmd},{value}\n")
+
+buffer = b""  # Temporary buffer for assembling complete UART messages
+
+def recv(timeout_ms=500):
+    """
+    Read UART input until a full line ('\n') is received or timeout expires.
+    Handles fragmented incoming data and returns the decoded message string.
+    """
+    global buffer
+    start = ticks_ms()
+    while ticks_diff(ticks_ms(), start) < timeout_ms:
+        if uart.any():  # Check if data is available on UART
+            data = uart.read()
+            if data:
+                buffer += data
+                if b"\n" in buffer:  # Full message line found
+                    line, _, buffer = buffer.partition(b"\n")
+                    try:
+                        msg = line.decode().strip()
+                        if msg:
+                            return msg
+                    except Exception as e:
+                        print(f"[DEBUG] Decode error: {e}")
+                        buffer = b""  # Reset buffer if bad data
+                        return None
+    return None  # Timeout — no complete message received
+
+def read_adc_avg(samples=20):
+    """Read ADC multiple times and return the average value to reduce noise."""
+    total = 0
+    for _ in range(samples):
+        total += adc.read_u16()
+    return total / samples
+
+# ---- Startup Stabilization ----
+print("Initializing UART... waiting 1s to settle.")
+sleep(1)
+uart.read()  # Flush out any startup garbage data
+sleep(0.5)
+
+# ---- Determine Role (Controller or Monitor) ----
+print("Booting... waiting 5 seconds for UART traffic to determine role.")
+msg = recv(timeout_ms=5000)  # If we hear something, we’re a monitor
+
+if msg:
+    role = "monitor"    # Heard UART activity → must be the receiver
+else:
+    role = "controller" # No UART input → must be the sender
+
+print("Role:", role.upper())
+led.value(1 if role == "controller" else 0)
+sleep(1)
+
+# ---- Variables ----
+duty = 16384       # Initial PWM duty cycle (25%)
+direction = 1       # Used to increase/decrease PWM smoothly
+
+# ---- CONTROLLER CODE ----
+if role == "controller":
+    print("[Controller] Starting 3 signal transmissions (2s apart).")
+    for i in range(3):
+        # Set PWM output and send the value to the monitor
+        pwm.duty_u16(duty)
+        send("SET", duty)
+        print(f"[Controller] Sent duty {duty} (Signal {i+1}/3)")
+
+        # Wait for monitor's measurement response
+        resp = recv(timeout_ms=1500)
+        if resp:
+            print(f"[Controller] Raw response: {resp}")
+            if resp.startswith("MEAS,"):
+                try:
+                    _, meas_str = resp.split(",", 1)
+                    meas = float(meas_str)
+                    error = abs(meas - duty) / 65535 * 100
+                    print(f"[Controller] Measured {meas:.0f} | Error {error:.2f}%")
+                except Exception as e:
+                    print(f"[Controller] Parse error: {e}")
+            else:
+                print(f"[Controller] Unexpected response: {resp}")
+        else:
+            print("[Controller] No response this cycle.")
+
+        # Adjust PWM duty for next round (increase/decrease alternately)
+        duty += 8192 * direction
+        if duty >= 65535:
+            duty, direction = 65535, -1
+        elif duty <= 0:
+            duty, direction = 0, 1
+
+        led.toggle()
+        sleep(2)
+
+    print("[Controller] Finished all 3 signals.")
+    pwm.duty_u16(0)
+    led.value(0)
+
+# ---- MONITOR CODE ----
+else:
+    print("[Monitor] Waiting to receive up to 3 signals.")
+    received = 0
+    while received < 3:
+        msg = recv(timeout_ms=2000)
+        if msg:
+            print(f"[Monitor] Raw message: '{msg}'")
+            try:
+                parts = msg.split(",")
+                # Expecting "SET,<value>"
+                if len(parts) == 2 and parts[0] == "SET":
+                    val = float(parts[1])                # Controller’s duty
+                    meas = read_adc_avg()                # Measured ADC value
+                    send("MEAS", meas)                   # Send back measurement
+                    error = abs(meas - val) / 65535 * 100  # Calculate % error
+                    print(f"[Monitor] Signal {received+1}/3 | Measured {meas:.0f}, Error {error:.2f}%")
+                    led.toggle()
+                    received += 1
+                else:
+                    print(f"[Monitor] Ignored malformed message: '{msg}'")
+            except Exception as e:
+                print(f"[Monitor] Message parse error: {e} | Raw: '{msg}'")
+        else:
+            # No new messages; loop continues indefinitely
+            pass
+
+    print("[Monitor] Received all 3 signals, ending session.")
+    led.value(0)
+
+# --- VERSION 6.1 END ---
